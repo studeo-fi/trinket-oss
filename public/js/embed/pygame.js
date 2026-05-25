@@ -381,6 +381,7 @@ function runCode() {
 
           var resetOnce = false;
           var settingUpDone = settingUp();
+          var codeSent = false;
 
           initGraphicsOutput();
           initConsoleOutput();
@@ -390,6 +391,12 @@ function runCode() {
           api.rfbMaxAttempts = 25;
 
           function rfb_connect(e) {
+            // Only send code once per run action. If VNC reconnects
+            // (e.g. due to a transient connection issue), the Python
+            // process is already running on the server - no need to resend.
+            if (codeSent) return;
+            codeSent = true;
+
             // try connecting to audiostream...
             try {
               audiostream.connect(instanceData.audioUrl, audioCallback);

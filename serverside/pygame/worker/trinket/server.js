@@ -50,10 +50,40 @@ io.on('connection', (socket) => {
   let watcher = null;
   let childReady = false;
   let childEnded = false;
+  let processTimeout = null;
+  let exitTimeout = null;
+  let evalGeneration = 0;
 
   // Handle code execution
   socket.on('eval', async (data) => {
     try {
+      // Increment generation so stale exit handlers from killed processes are ignored
+      evalGeneration++;
+
+      // Clean up any previous session before starting a new one
+      if (exitTimeout) {
+        clearTimeout(exitTimeout);
+        exitTimeout = null;
+      }
+      if (child) {
+        try {
+          child.stdin.end();
+          child.kill('SIGKILL');
+        } catch (e) { /* ignore */ }
+        child = null;
+      }
+      if (watcher) {
+        await watcher.close();
+        watcher = null;
+      }
+      if (sessionDir) {
+        try { await rm(sessionDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+        sessionDir = null;
+      }
+      clearTimeout(processTimeout);
+      childReady = false;
+      childEnded = false;
+
       // Create session directory
       const hash = createHash('sha256');
       hash.update(Math.random().toString() + Date.now());
@@ -140,7 +170,31 @@ io.on('connection', (socket) => {
 
         const errors = [];
 
+        // Capture current generation to detect stale exit handlers.
+        // If a new eval arrives and kills this process, the exit handler
+        // must not interfere with the new session.
+        const myGeneration = evalGeneration;
+
+        // Kill process after 60 seconds (handles turtle.mainloop() blocking forever)
+        processTimeout = setTimeout(() => {
+          if (child && !childEnded) {
+            console.log(`Process timeout reached for ${socket.id}, killing child`);
+            try {
+              child.kill('SIGTERM');
+              // Force kill after 2 seconds if SIGTERM doesn't work
+              setTimeout(() => {
+                if (child && !childEnded) {
+                  child.kill('SIGKILL');
+                }
+              }, 2000);
+            } catch (e) {
+              console.error('Timeout kill error:', e);
+            }
+          }
+        }, 60000);
+
         child.stdout.on('data', (data) => {
+          if (myGeneration !== evalGeneration) return;
           // Check for clear screen escape sequence
           if (/\x1b\[H\x1b\[2J/.test(data)) {
             socket.emit('clear');
@@ -150,10 +204,14 @@ io.on('connection', (socket) => {
         });
 
         child.stderr.on('data', (data) => {
+          if (myGeneration !== evalGeneration) return;
           errors.push(data);
         });
 
         child.on('exit', async (code, signal) => {
+          // Ignore exit from a process that was superseded by a newer eval
+          if (myGeneration !== evalGeneration) return;
+
           childEnded = true;
 
           if (errors.length) {
@@ -171,6 +229,7 @@ io.on('connection', (socket) => {
         });
 
         child.on('error', (err) => {
+          if (myGeneration !== evalGeneration) return;
           console.error('Child process error:', err);
           socket.emit('script error', {
             error: 'Error: The Python process ended unexpectedly. Please try again.'
